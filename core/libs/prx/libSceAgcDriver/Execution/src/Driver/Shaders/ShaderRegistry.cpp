@@ -24,6 +24,7 @@
 #include <deque>
 #include <exception>
 #include <functional>
+#include <future>
 #include <list>
 #include <atomic>
 #include <pthread.h>
@@ -1514,7 +1515,16 @@ void Driver::RegisterShader(const Shader* shader) {
     rethrowFailure();
     PublishRegisteredShader(shaders, published);
     if (shaders->find(NullPixelProgramAddress()) == shaders->end()) {
-        PublishRegisteredShader(shaders, std::make_shared<const ShaderSnapshot>(PrepareNullPixelProgram(*localDevice)));
+        // Preparing the null pixel program uses the shader recompiler's large stack frames; guest threads may have small stacks, so run it on the preparation pool.
+        std::promise<ShaderSnapshot> nullPrepared;
+        RegistrationPreparePool::Instance().Submit([&nullPrepared, localDevice] {
+            try {
+                nullPrepared.set_value(PrepareNullPixelProgram(*localDevice));
+            } catch (...) {
+                nullPrepared.set_exception(std::current_exception());
+            }
+        });
+        PublishRegisteredShader(shaders, std::make_shared<const ShaderSnapshot>(nullPrepared.get_future().get()));
     }
     transaction.Commit();
     if (preparation != nullptr) PrepareRegisteredInBackground(published, std::move(preparation));
