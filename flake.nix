@@ -157,5 +157,23 @@
 
         relinker = relinkerShell pkgs;
       });
+
+      packages = forAllSystems (pkgs: {
+        runtime = pkgs.buildFHSEnv {
+          name = "anyps5-runtime";
+
+          targetPkgs =
+            pkgs:
+            (runtimeLibs pkgs)
+            ++ [
+              pkgs.glibc
+              pkgs.gcc.cc.lib
+              pkgs.wayland
+              pkgs.libxkbcommon
+            ];
+
+          runScript = "bash";
+        };
+      });
     };
 }
