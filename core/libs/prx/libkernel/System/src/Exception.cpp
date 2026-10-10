@@ -5,8 +5,9 @@
 #include "prx/libkernel/KernelErrors.hpp"
 #include "prx/libkernel/Pthread/include/Pthread.hpp"
 #include <array>
-#include <chrono>
 #include <atomic>
+#include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -306,6 +307,20 @@ bool RaiseOn(Pthread thread, GuestExceptionHandler handler, int signum) {
 constexpr int HostSignal = SIGUSR1;
 constexpr std::size_t FxsaveRegisterBytes = 416;
 
+const bool RaiseTraceEnabled = std::getenv("APS5_TRACE_RAISE") != nullptr;
+std::atomic<std::uint64_t> RaiseRequests{0};
+std::atomic<std::uint64_t> RaiseEntries{0};
+std::atomic<std::uint64_t> RaiseExits{0};
+std::atomic<std::uint64_t> RaiseDrops{0};
+
+void RaiseTrace(const char* kind, std::uint64_t sequence, std::uint64_t target, std::uint64_t detail) {
+    if (!RaiseTraceEnabled) return;
+    char buffer[128];
+    const int length = std::snprintf(buffer, sizeof(buffer), "[raise] %s seq=%llu target=%llx detail=%llx\n", kind,
+        static_cast<unsigned long long>(sequence), static_cast<unsigned long long>(target), static_cast<unsigned long long>(detail));
+    if (length > 0) (void)!::write(2, buffer, static_cast<std::size_t>(length < static_cast<int>(sizeof(buffer)) ? length : static_cast<int>(sizeof(buffer)) - 1));
+}
+
 void FromHost(const mcontext_t& host, GuestMcontext& m) {
     const auto* g = host.gregs;
     m.rdi = g[REG_RDI];
@@ -357,18 +372,25 @@ void ToHost(const GuestMcontext& m, mcontext_t& host) {
 }
 
 void Deliver(int, siginfo_t*, void* context) {
+    const auto target = static_cast<std::uint64_t>(::pthread_self());
     const auto handler = Handler(RaisedSignal);
     if (handler == nullptr) {
+        RaiseTrace("drop", RaiseDrops.fetch_add(1, std::memory_order_relaxed) + 1, target, 0);
         static constexpr char message[] = "sceKernelRaiseException: the handler was removed before the signal was delivered\n";
         const auto written = write(STDERR_FILENO, message, sizeof(message) - 1);
         (void)written;
         std::abort();
     }
+    const auto sequence = RaiseEntries.fetch_add(1, std::memory_order_relaxed) + 1;
+    RaiseTrace("enter", sequence, target, 0);
     auto& host = static_cast<ucontext_t*>(context)->uc_mcontext;
     GuestUcontext ucontext{};
     FromHost(host, ucontext.mcontext);
+    const auto before = ucontext.mcontext;
     CallHandler(handler, RaisedSignal, ucontext);
+    if (std::memcmp(&before, &ucontext.mcontext, sizeof(GuestMcontext)) != 0) RaiseTrace("changed", sequence, ucontext.mcontext.rip, ucontext.mcontext.rsp);
     ToHost(ucontext.mcontext, host);
+    RaiseTrace("exit", RaiseExits.fetch_add(1, std::memory_order_relaxed) + 1, target, 0);
 }
 
 void InstallDelivery() {
@@ -386,6 +408,8 @@ void InstallDelivery() {
 
 bool Send(Pthread thread) {
     const int result = pthread_kill(thread->hostThread, HostSignal);
+    RaiseTrace("request", RaiseRequests.fetch_add(1, std::memory_order_relaxed) + 1,
+        static_cast<std::uint64_t>(thread->hostThread), static_cast<std::uint64_t>(static_cast<std::uint32_t>(result)));
     if (result == ESRCH) return false;
     if (result != 0) throw std::system_error(result, std::generic_category(), "sceKernelRaiseException: cannot signal the target thread");
     return true;
